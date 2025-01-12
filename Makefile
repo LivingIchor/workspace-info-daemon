@@ -6,8 +6,8 @@ OBJDIR = obj
 SRCDIR = src
 
 TARGET = workspace-info-daemon
-SRCS = $(waldcard $(SRCDIR)/*.c)
-OBJS = $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))
+SRCS := $(wildcard $(SRCDIR)/*.c)
+OBJS := $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))
 
 all : $(BINDIR)/$(TARGET)
 

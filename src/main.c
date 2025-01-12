@@ -296,14 +296,12 @@ search_dir(DIR *dirp, const char *dirpath, struct search_queue *sq, int in_fd,
 	}
 }
 
-void *
-manage_paths(void *args)
+void
+populate_paths(struct search_queue sq, const char **top_dirs)
 {
-	const char **app_locales = (const char **)args;
-	struct search_queue sq;
 	for (int i = 0; i < LOCALE_COUNT; i++) {
 		sq_add_dir(&sq,
-			   strndup(app_locales[i], strlen(app_locales[i])));
+			   strndup(top_dirs[i], strlen(top_dirs[i])));
 	}
 
 	int fd = inotify_init();
@@ -339,7 +337,16 @@ manage_paths(void *args)
 
 		sq_del_dir(&sq);
 	}
+}
+
+void *
+manage_paths(void *args)
+{
+	const char **app_locales = (const char **)args;
+	struct search_queue sq = { NULL };
 	
+	populate_paths(sq, app_locales);
+
 	paths_debug(icon_paths);
 
 	return NULL;
