@@ -5,12 +5,16 @@
 #include <pthread.h>
 #include <dirent.h>
 #include <string.h>
+#include <unistd.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #define LOCALE_COUNT 3
 #define MAX_FPATH_SIZE 4096
 #define TABLE_SIZE 1024
+#define MAX_LINE 4096
 
 struct path_entry {
 	const char *desk_name;
@@ -372,9 +376,6 @@ manage_paths(void *args)
 	
 	populate_paths(watches, app_locales);
 
-	paths_debug(icon_paths);
-	
-	paths_free(icon_paths);
 	for (int i = 0; i < 4096; i++) {
 		if (watches[i].fpath != NULL)
 			free((void *)watches[i].fpath);
@@ -400,8 +401,41 @@ main(void)
 	pthread_t paths_thread;
 
 	pthread_create(&paths_thread, NULL, manage_paths, app_locales);
-
 	pthread_join(paths_thread, NULL);
+
+	int sockfd;
+	struct sockaddr_un servaddr;
+	char recvline[MAX_LINE] = {0};
+
+	if ((sockfd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+		perror("Err opening socket");
+		return EXIT_FAILURE;
+	}
+
+	servaddr.sun_family = AF_UNIX;
+	{
+		char unix_path[4096];
+		sprintf(unix_path, "%s/hypr/%s/.socket2.sock",
+			getenv("XDG_RUNTIME_DIR"),
+			getenv("HYPRLAND_INSTANCE_SIGNATURE"));
+
+		strcpy(servaddr.sun_path, unix_path);
+	}
+
+	if (connect(sockfd, (struct sockaddr *)&servaddr, sizeof(servaddr)) == -1) {
+		perror("Err making connection to socket");
+		return EXIT_FAILURE;
+	}
+
+	while (read(sockfd, &recvline, MAX_LINE - 1) > -1) {
+		printf("%s\n", recvline);
+		memset(recvline, 0, MAX_LINE);
+	}
+	perror("Err while reading socket");
+	return EXIT_FAILURE;
+
+	close(sockfd);
+	paths_free(icon_paths);
 
 	return EXIT_SUCCESS;
 }
