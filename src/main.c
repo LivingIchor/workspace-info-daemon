@@ -56,6 +56,18 @@ paths_add_entry(struct path_entry **paths, struct path_entry *entry)
 }
 
 void
+paths_free(struct path_entry **paths)
+{
+	for (int i = 0; i < TABLE_SIZE; i++) {
+		if (paths[i] != NULL) {
+			free((void *)paths[i]->desk_name);
+			free((void *)paths[i]->icon_path);
+			free((void *)paths[i]);
+		}
+	}
+}
+
+void
 paths_debug(struct path_entry **paths)
 {
 	puts("{");
@@ -96,9 +108,10 @@ sq_del_dir(struct search_queue *sq)
 		sq->tail = oldtail->prev;
 		if (sq->tail != NULL)
 			sq->tail->next = NULL;
+		free((void *)oldtail->dirpath);
+		free(oldtail);
 	}
 
-	free(oldtail);
 }
 
 int
@@ -121,6 +134,7 @@ file_fast_forward_to(FILE *fp, const char *target, const size_t len)
 	assert(strlen(target) == len);
 
 	char searchbuf[len];
+	memset(searchbuf, 0, len);
 
 	for (int filepos = 0; (searchbuf[filepos % len] = fgetc(fp)) != EOF;
 	     filepos++) {
@@ -199,21 +213,25 @@ find_icon_path(const char *ifield)
 					if (fpath[strlen(fpath) - fnamelen] == '/')
 						break;
 				}
-				if (fnamelen == strlen(fpath))
+				if (fnamelen == strlen(fpath)) {
+					free((void *)fpath);
 					continue;
+				}
 
 				fname = &fpath[strlen(fpath) - fnamelen + 1];
 
 				if (strcmp(fname, target) == 0) {
 					ipath = strdup(fpath);
+					free((void *)fpath);
 					sq_destroy(&sq);
 					break;
 				}
 			}
+			free((void *)fpath);
 		}
+		closedir(dirp);
 		sq_del_dir(&sq);
 	}
-	free((void *)fpath);
 
 	return ipath;
 }
@@ -251,8 +269,10 @@ search_dir(DIR *dirp, const char *dirpath, struct search_queue *sq, int in_fd,
 			sq_add_dir(sq, fpath);
 		} else if (S_ISREG(statbuf.st_mode)) {
 			if (strncmp(&fpath[strlen(fpath) - 8], ".desktop", 8) !=
-			    0)
+			    0) {
+				free((void *)fpath);
 				continue;
+			}
 
 			wd = inotify_add_watch(in_fd, fpath,
 					       IN_DELETE_SELF |
@@ -265,11 +285,13 @@ search_dir(DIR *dirp, const char *dirpath, struct search_queue *sq, int in_fd,
 			}
 			if (!file_fast_forward_to(fp, "\nIcon=", 6)) {
 				watches[wd].ifield = NULL;
+				fclose(fp);
 				continue;
 			}
 
 			const char *ifield = file_copy_line(fp);
 			watches[wd].ifield = ifield;
+			fclose(fp);
 
 			const char *ipath = find_icon_path(ifield);
 			if (ipath == NULL)
@@ -280,8 +302,10 @@ search_dir(DIR *dirp, const char *dirpath, struct search_queue *sq, int in_fd,
 				if (fpath[strlen(fpath) - fnamelen] == '/')
 					break;
 			}
-			if (fnamelen == strlen(fpath))
+			if (fnamelen == strlen(fpath)) {
+				free((void *)ipath);
 				continue;
+			}
 
 			fname = &fpath[strlen(fpath) - fnamelen + 1];
 
@@ -297,8 +321,9 @@ search_dir(DIR *dirp, const char *dirpath, struct search_queue *sq, int in_fd,
 }
 
 void
-populate_paths(struct search_queue sq, const char **top_dirs)
+populate_paths(struct watch *watches, const char **top_dirs)
 {
+	struct search_queue sq = { NULL };
 	for (int i = 0; i < LOCALE_COUNT; i++) {
 		sq_add_dir(&sq,
 			   strndup(top_dirs[i], strlen(top_dirs[i])));
@@ -309,7 +334,6 @@ populate_paths(struct search_queue sq, const char **top_dirs)
 	DIR *dirp;
 	const char *dirpath;
 	int wd;
-	struct watch watches[4096];
 
 	while (!sq_empty(&sq)) {
 		dirpath = sq.tail->dirpath;
@@ -322,7 +346,7 @@ populate_paths(struct search_queue sq, const char **top_dirs)
 
 		wd = inotify_add_watch(fd, dirpath,
 				       IN_MOVE | IN_CREATE | IN_DELETE);
-		watches[wd].fpath = dirpath;
+		watches[wd].fpath = strdup(dirpath);
 		watches[wd].ifield = NULL;
 
 		errno = 0;
@@ -335,6 +359,7 @@ populate_paths(struct search_queue sq, const char **top_dirs)
 			continue;
 		}
 
+		closedir(dirp);
 		sq_del_dir(&sq);
 	}
 }
@@ -342,12 +367,20 @@ populate_paths(struct search_queue sq, const char **top_dirs)
 void *
 manage_paths(void *args)
 {
+	struct watch watches[4096] = {0};
 	const char **app_locales = (const char **)args;
-	struct search_queue sq = { NULL };
 	
-	populate_paths(sq, app_locales);
+	populate_paths(watches, app_locales);
 
 	paths_debug(icon_paths);
+	
+	paths_free(icon_paths);
+	for (int i = 0; i < 4096; i++) {
+		if (watches[i].fpath != NULL)
+			free((void *)watches[i].fpath);
+		if (watches[i].ifield != NULL)
+			free((void *)watches[i].ifield);
+	}
 
 	return NULL;
 }
