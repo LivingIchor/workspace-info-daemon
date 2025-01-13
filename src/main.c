@@ -11,6 +11,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
+#include "cJSON.h"
+
 #define LOCALE_COUNT 3
 #define MAX_FPATH_SIZE 4096
 #define TABLE_SIZE 1024
@@ -57,6 +59,20 @@ paths_add_entry(struct path_entry **paths, struct path_entry *entry)
 			break;
 		}
 	}
+}
+
+const char *
+paths_get_icon(struct path_entry **paths, const char *fname)
+{
+	unsigned int hash = hashfunc(fname, strlen(fname));
+	for (int i = 0; i < TABLE_SIZE; i++) {
+		if (paths[(hash + i) % TABLE_SIZE] != NULL &&
+			strcmp(paths[(hash + i) % TABLE_SIZE]->desk_name, fname) == 0) {
+			return paths[(hash + i) % TABLE_SIZE]->icon_path;
+		}
+	}
+	
+	return NULL;
 }
 
 void
@@ -189,6 +205,7 @@ find_icon_path(const char *ifield)
 		ifield, ".png");
 
 	sq_add_dir(&sq, strdup("/usr/share/icons/hicolor/48x48/apps/"));
+	sq_add_dir(&sq, strdup("/usr/share/icons/hicolor/256x256/apps/"));
 
 	while (!sq_empty(&sq)) {
 		dirpath = sq.tail->dirpath;
@@ -406,6 +423,10 @@ main(void)
 	int sockfd;
 	struct sockaddr_un servaddr;
 	char recvline[MAX_LINE] = {0};
+	FILE *fp;
+	char json[4096] = {0};
+	cJSON *parsed_json, *workspace;
+	char *string = NULL;
 
 	if ((sockfd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
 		perror("Err opening socket");
@@ -428,8 +449,39 @@ main(void)
 	}
 
 	while (read(sockfd, &recvline, MAX_LINE - 1) > -1) {
-		printf("%s\n", recvline);
-		memset(recvline, 0, MAX_LINE);
+		const char *command =
+			"hyprctl workspaces -j | jq -c --argjson clients \"$(hyprctl clients -j)\" '"
+			"  sort_by(.id)"
+			"| map(select(.windows > 0)"
+			"  | {monitorID}"
+			"  + {lastwindowclass:"
+			"      (.lastwindow as $ws_window"
+			"      | $clients | .[]"
+			"      | select(.address == $ws_window)"
+			"      | .class)})'";
+		fp = popen(command, "r");
+		for (int i = 0; (json[i] = getc(fp)) != EOF; i++);
+
+		parsed_json = cJSON_Parse(json);
+
+		cJSON_ArrayForEach(workspace, parsed_json) {
+			cJSON *lastwindowclass = cJSON_GetObjectItem(workspace, "lastwindowclass");
+
+			if (paths_get_icon(icon_paths, lastwindowclass->valuestring) != NULL)
+				cJSON_AddStringToObject(workspace, "lastwindowicon", paths_get_icon(icon_paths, lastwindowclass->valuestring));
+			else
+				cJSON_AddStringToObject(workspace, "lastwindowicon", "");
+
+			cJSON_DeleteItemFromObject(workspace, "lastwindowclass");
+		}
+
+		string = cJSON_PrintUnformatted(parsed_json);
+		printf("%s\n", string);
+
+		memset(json, 0, 4096);
+		cJSON_Delete(parsed_json);
+		free(string);
+		string = NULL;
 	}
 	perror("Err while reading socket");
 	return EXIT_FAILURE;
