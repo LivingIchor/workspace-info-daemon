@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -g -Wall -pthread
+CFLAGS = -g -Wall -pthread -lcjson
 
 BINDIR = bin
 OBJDIR = obj
@@ -11,7 +11,7 @@ OBJS := $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))
 
 all : $(BINDIR)/$(TARGET)
 
-release : CFLAGS = -Wall -pthread
+release : CFLAGS = -O2 -Wall -pthread -lcjson
 release : clean
 release : $(BINDIR)/$(TARGET)
 

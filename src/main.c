@@ -10,8 +10,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-
-#include "cJSON.h"
+#include <cjson/cJSON.h>
 
 #define LOCALE_COUNT 3
 #define MAX_FPATH_SIZE 4096
@@ -50,7 +49,7 @@ hashfunc(const char *key, size_t len)
 }
 
 void
-paths_add_entry(struct path_entry **paths, struct path_entry *entry)
+paths_add_entry(volatile struct path_entry **paths, struct path_entry *entry)
 {
 	unsigned int hash = hashfunc(entry->desk_name, strlen(entry->desk_name));
 	for (int i = 0; i < TABLE_SIZE; i++) {
@@ -61,8 +60,25 @@ paths_add_entry(struct path_entry **paths, struct path_entry *entry)
 	}
 }
 
+void
+paths_del_entry(volatile struct path_entry **paths, const char *entry)
+{
+	unsigned int hash = hashfunc(entry, strlen(entry));
+	for (int i = 0; i < TABLE_SIZE; i++) {
+		if (paths[(hash + i) % TABLE_SIZE] != NULL &&
+				strcmp(paths[(hash + i) % TABLE_SIZE]->desk_name, entry) == 0) {
+			free((void *)paths[(hash + i) % TABLE_SIZE]->desk_name);
+			free((void *)paths[(hash + i) % TABLE_SIZE]->icon_path);
+			free((void *)paths[(hash + i) % TABLE_SIZE]);
+			paths[(hash + i) % TABLE_SIZE] = NULL;
+
+			break;
+		}
+	}
+}
+
 const char *
-paths_get_icon(struct path_entry **paths, const char *fname)
+paths_get_icon(volatile struct path_entry **paths, const char *fname)
 {
 	unsigned int hash = hashfunc(fname, strlen(fname));
 	for (int i = 0; i < TABLE_SIZE; i++) {
@@ -76,7 +92,7 @@ paths_get_icon(struct path_entry **paths, const char *fname)
 }
 
 void
-paths_free(struct path_entry **paths)
+paths_free(volatile struct path_entry **paths)
 {
 	for (int i = 0; i < TABLE_SIZE; i++) {
 		if (paths[i] != NULL) {
@@ -88,7 +104,7 @@ paths_free(struct path_entry **paths)
 }
 
 void
-paths_debug(struct path_entry **paths)
+paths_debug(volatile struct path_entry **paths)
 {
 	puts("{");
 	for (int i = 0; i < TABLE_SIZE; i++) {
@@ -204,12 +220,17 @@ find_icon_path(const char *ifield)
 	snprintf(target, strlen(ifield) + 5, "%s%s",
 		ifield, ".png");
 
-	sq_add_dir(&sq, strdup("/usr/share/icons/hicolor/48x48/apps/"));
-	sq_add_dir(&sq, strdup("/usr/share/icons/hicolor/256x256/apps/"));
+	snprintf(tmpfpath, MAX_FPATH_SIZE, "%s%s", getenv("HOME"), "/.local/share/icons/hicolor/");
+	sq_add_dir(&sq, strdup("/usr/share/icons/hicolor/"));
+	sq_add_dir(&sq, strdup(tmpfpath));
 
 	while (!sq_empty(&sq)) {
 		dirpath = sq.tail->dirpath;
-		dirp = opendir(dirpath);
+		if ((dirp = opendir(dirpath)) == NULL) {
+			fprintf(stderr, "Err opening dir '%s': %s\n", dirpath, strerror(errno));
+			sq_del_dir(&sq);
+			continue;
+		}
 
 		while ((dp = readdir(dirp)) != NULL) {
 			if (dp->d_name[0] == '.')
@@ -248,7 +269,6 @@ find_icon_path(const char *ifield)
 					break;
 				}
 			}
-			free((void *)fpath);
 		}
 		closedir(dirp);
 		sq_del_dir(&sq);
@@ -257,7 +277,7 @@ find_icon_path(const char *ifield)
 	return ipath;
 }
 
-struct path_entry *icon_paths[TABLE_SIZE];
+volatile struct path_entry *icon_paths[TABLE_SIZE];
 
 void
 search_dir(DIR *dirp, const char *dirpath, struct search_queue *sq, int in_fd,
@@ -265,10 +285,9 @@ search_dir(DIR *dirp, const char *dirpath, struct search_queue *sq, int in_fd,
 {
 	int wd;
 	struct dirent *dp;
-	char tmpfpath[MAX_FPATH_SIZE];
-	const char *fpath;
+	char ch, *fnamelower, tmpfpath[MAX_FPATH_SIZE];
+	const char *fpath, *fname;
 	struct stat statbuf;
-	const char *fname;
 	FILE *fp;
 
 	while ((dp = readdir(dirp)) != NULL) {
@@ -295,9 +314,7 @@ search_dir(DIR *dirp, const char *dirpath, struct search_queue *sq, int in_fd,
 				continue;
 			}
 
-			wd = inotify_add_watch(in_fd, fpath,
-					       IN_DELETE_SELF |
-					       IN_MOVE_SELF | IN_MODIFY);
+			wd = inotify_add_watch(in_fd, fpath, IN_MODIFY | IN_DELETE_SELF);
 			watches[wd].fpath = fpath;
 
 			if ((fp = fopen(fpath, "r")) == NULL) {
@@ -330,8 +347,14 @@ search_dir(DIR *dirp, const char *dirpath, struct search_queue *sq, int in_fd,
 
 			fname = &fpath[strlen(fpath) - fnamelen + 1];
 
+			fnamelower = strndup(fname, fnamelen - 9);
+			for (int i = 0; i < strlen(fnamelower); i++) {
+				if ((ch = fnamelower[i]) >= 'A' && ch <= 'Z')
+					fnamelower[i] = ch + 32;
+			}
+
 			struct path_entry *icon_info = malloc(sizeof(struct path_entry));
-			icon_info->desk_name = strndup(fname, fnamelen - 9);
+			icon_info->desk_name = fnamelower;
 			icon_info->icon_path = ipath;
 
 			paths_add_entry(icon_paths, icon_info);
@@ -342,7 +365,7 @@ search_dir(DIR *dirp, const char *dirpath, struct search_queue *sq, int in_fd,
 }
 
 void
-populate_paths(struct watch *watches, const char **top_dirs)
+populate_paths(int fd, struct watch *watches, const char **top_dirs)
 {
 	struct search_queue sq = { NULL };
 	for (int i = 0; i < LOCALE_COUNT; i++) {
@@ -350,7 +373,6 @@ populate_paths(struct watch *watches, const char **top_dirs)
 			   strndup(top_dirs[i], strlen(top_dirs[i])));
 	}
 
-	int fd = inotify_init();
 
 	DIR *dirp;
 	const char *dirpath;
@@ -366,7 +388,7 @@ populate_paths(struct watch *watches, const char **top_dirs)
 		}
 
 		wd = inotify_add_watch(fd, dirpath,
-				       IN_MOVE | IN_CREATE | IN_DELETE);
+				       IN_MOVE | IN_DELETE_SELF | IN_CLOSE_WRITE);
 		watches[wd].fpath = strdup(dirpath);
 		watches[wd].ifield = NULL;
 
@@ -388,10 +410,104 @@ populate_paths(struct watch *watches, const char **top_dirs)
 void *
 manage_paths(void *args)
 {
-	struct watch watches[4096] = {0};
 	const char **app_locales = (const char **)args;
-	
-	populate_paths(watches, app_locales);
+
+	int wd, fd = inotify_init();
+	struct watch watches[4096] = {0};
+	struct inotify_event *in_event;
+	char chbuf[sizeof(struct inotify_event) + NAME_MAX + 1];
+	size_t fnamelen, fpathlen, bytes_read, bytes_used;
+	FILE *fp;
+	char ch, *fnamelower, fpath[MAX_FPATH_SIZE];
+
+	populate_paths(fd, watches, app_locales);
+
+	while (1) {
+		if ((bytes_read = read(fd, chbuf, sizeof(struct inotify_event) + NAME_MAX + 1)) < 1) {
+			perror("Err reading watch");
+			exit(EXIT_FAILURE);
+		}
+
+		in_event = (struct inotify_event *)chbuf;
+		while (bytes_read > bytes_used) {
+			switch (in_event->mask) {
+			case IN_CLOSE_WRITE:
+				fnamelen = strlen(in_event->name);
+				if (fnamelen < 8 || strcmp(&in_event->name[fnamelen - 8], ".desktop") != 0)
+					break;
+
+				snprintf(fpath, MAX_FPATH_SIZE, "%s%s", watches[in_event->wd].fpath, in_event->name);
+
+				wd = inotify_add_watch(fd, fpath, IN_MODIFY | IN_DELETE_SELF);
+				watches[wd].fpath = strdup(fpath);
+
+				if ((fp = fopen(fpath, "r")) == NULL) {
+					fprintf(stderr, "Failed to open '%s': %s\n", fpath, strerror(errno));
+					break;
+				}
+				if (!file_fast_forward_to(fp, "\nIcon=", 6)) {
+					watches[wd].ifield = NULL;
+					fclose(fp);
+					break;
+				}
+
+				const char *ifield = file_copy_line(fp);
+				watches[wd].ifield = ifield;
+				fclose(fp);
+
+				const char *ipath = find_icon_path(ifield);
+				if (ipath == NULL)
+					break;
+
+				fnamelower = strndup(in_event->name, fnamelen - 8);
+				for (int i = 0; i < strlen(fnamelower); i++) {
+					if ((ch = fnamelower[i]) >= 'A' && ch <= 'Z')
+						fnamelower[i] = ch + 32;
+				}
+
+				struct path_entry *icon_info = malloc(sizeof(struct path_entry));
+				icon_info->desk_name = fnamelower;
+				icon_info->icon_path = ipath;
+
+				paths_add_entry(icon_paths, icon_info);
+
+				break;
+			case IN_DELETE_SELF:
+				fpathlen = strlen(watches[in_event->wd].fpath);
+				if (strcmp(&watches[in_event->wd].fpath[fpathlen - 8], ".desktop") != 0) {
+					free((void *)watches[in_event->wd].fpath);
+					watches[in_event->wd].fpath = NULL;
+					free((void *)watches[in_event->wd].ifield);
+					watches[in_event->wd].ifield = NULL;
+
+					break;
+				}
+
+				for (fnamelen = 0; fnamelen < fpathlen; fnamelen++) {
+					if (watches[in_event->wd].fpath[fpathlen - fnamelen] == '/') {
+						fnamelen--;
+						break;
+					}
+				}
+
+				strncpy(fpath, &watches[in_event->wd].fpath[fpathlen - fnamelen], fnamelen - 8);
+				fpath[fnamelen - 8] = '\0';
+
+				paths_del_entry(icon_paths, fpath);
+
+				free((void *)watches[in_event->wd].fpath);
+				watches[in_event->wd].fpath = NULL;
+				free((void *)watches[in_event->wd].ifield);
+				watches[in_event->wd].ifield = NULL;
+
+				break;
+			}
+
+			bytes_used += sizeof(struct inotify_event) + in_event->len;
+			in_event = (struct inotify_event *)&chbuf[bytes_used];
+		}
+		bytes_used = 0;
+	}
 
 	for (int i = 0; i < 4096; i++) {
 		if (watches[i].fpath != NULL)
@@ -418,7 +534,6 @@ main(void)
 	pthread_t paths_thread;
 
 	pthread_create(&paths_thread, NULL, manage_paths, app_locales);
-	pthread_join(paths_thread, NULL);
 
 	int sockfd;
 	struct sockaddr_un servaddr;
@@ -448,12 +563,13 @@ main(void)
 		return EXIT_FAILURE;
 	}
 
-	while (read(sockfd, &recvline, MAX_LINE - 1) > -1) {
+	do {
 		const char *command =
 			"hyprctl workspaces -j | jq -c --argjson clients \"$(hyprctl clients -j)\" '"
 			"  sort_by(.id)"
 			"| map(select(.windows > 0)"
-			"  | {monitorID}"
+			"  | {id,"
+			"     monitorID}"
 			"  + {lastwindowclass:"
 			"      (.lastwindow as $ws_window"
 			"      | $clients | .[]"
@@ -467,22 +583,32 @@ main(void)
 		cJSON_ArrayForEach(workspace, parsed_json) {
 			cJSON *lastwindowclass = cJSON_GetObjectItem(workspace, "lastwindowclass");
 
-			if (paths_get_icon(icon_paths, lastwindowclass->valuestring) != NULL)
-				cJSON_AddStringToObject(workspace, "lastwindowicon", paths_get_icon(icon_paths, lastwindowclass->valuestring));
+			char ch;
+			char *classlower = strdup(lastwindowclass->valuestring);
+			for (int i = 0; i < strlen(classlower); i++) {
+				if ((ch = classlower[i]) >= 'A' && ch <= 'Z')
+					classlower[i] = ch + 32;
+			}
+
+			if (paths_get_icon(icon_paths, classlower) != NULL)
+				cJSON_AddStringToObject(workspace, "lastwindowicon", paths_get_icon(icon_paths, classlower));
 			else
 				cJSON_AddStringToObject(workspace, "lastwindowicon", "");
 
 			cJSON_DeleteItemFromObject(workspace, "lastwindowclass");
+			free(classlower);
 		}
 
 		string = cJSON_PrintUnformatted(parsed_json);
 		printf("%s\n", string);
+		/* paths_debug(icon_paths); */
+		fflush(stdout);
 
 		memset(json, 0, 4096);
 		cJSON_Delete(parsed_json);
 		free(string);
 		string = NULL;
-	}
+	} while (read(sockfd, &recvline, MAX_LINE - 1) > -1);
 	perror("Err while reading socket");
 	return EXIT_FAILURE;
 
